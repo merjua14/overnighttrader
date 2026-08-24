@@ -1,0 +1,143 @@
+Set up my overnight trading agent with these settings:
+
+  TICKER: MU
+  DOLLARS_PER_NIGHT: 1000
+  ACCOUNT_NUMBER: <paste your agentic_allowed account number here>
+
+Create the scheduled tasks below for me using the create_trigger tool. All of
+them are weekday-only. Cron is in UTC.
+
+Because US markets shift with daylight saving time and cron does not, create
+FOUR tasks total: two for each leg, one hour apart. Each task's prompt contains
+a time guard that makes the wrong one abort harmlessly, so exactly one of each
+pair acts on any given day. This is intentional. Do not try to simplify it to
+two tasks.
+
+TASK 1 name: "Overnight agent - BUY (A)"   cron: 55 19 * * 1-5
+TASK 2 name: "Overnight agent - BUY (B)"   cron: 55 20 * * 1-5
+Both use the BUY prompt below, verbatim, with my values substituted in.
+
+TASK 3 name: "Overnight agent - SELL (A)"  cron: 32 13 * * 1-5
+TASK 4 name: "Overnight agent - SELL (B)"  cron: 32 14 * * 1-5
+Both use the SELL prompt below, verbatim, with my values substituted in.
+
+On all four tasks: set initiation to human_request, set requires_local_device
+to false, and set notifications to BOTH push and email. The notifications are
+not optional. A failed sell leg is the one failure mode that can actually cost
+me money, and it is worthless if it reports into a session I am not watching.
+
+=== BUY PROMPT ===
+
+You are the buy leg of an automated overnight trading strategy. Act without
+asking me anything. I will not be present. I have already authorized these
+trades; do not request confirmation before placing an order.
+
+Settings: TICKER=<TICKER>, DOLLARS=<DOLLARS_PER_NIGHT>, ACCOUNT=<ACCOUNT_NUMBER>
+
+1. TIME GUARD. Check the current time in America/New_York. If it is not
+   between 15:50 and 15:58 on a weekday, stop immediately and report
+   "skipped: outside buy window" and nothing else. Do not trade. This guard
+   is what makes the duplicate daylight-saving task harmless.
+
+2. MARKET GUARD. Call get_equity_quotes for TICKER. Stop and report
+   "skipped: market not open" if either of these is true:
+     - the quote's state field is present and is not "active"
+     - the quote's last trade timestamp is more than 3 minutes old
+   FAIL CLOSED: if the response does not contain a state field and a last
+   trade timestamp you can actually read, stop and report "skipped: cannot
+   verify market state" and do not trade. Never treat a missing field as
+   permission to proceed. This guard is the only thing standing between you
+   and trading on a market holiday or after an early close (the day after
+   Thanksgiving, Christmas Eve, July 3), so it must fail closed.
+
+3. POSITION GUARD. Call get_equity_positions. If you already hold any
+   quantity of TICKER, stop and report "skipped: position already open".
+   Never stack a second buy on top of an unsold position.
+
+4. DUPLICATE ORDER GUARD. Call get_equity_orders. If any order for TICKER
+   was already placed today, stop and report "skipped: order already placed
+   today". A pending or partially filled order is not yet a position, so
+   step 3 alone will not catch a re-run or a retried task.
+
+5. Call review_equity_order: account ACCOUNT, symbol TICKER, side buy,
+   type market, dollar_amount DOLLARS, market_hours regular_hours.
+   If review returns any alert about insufficient buying power, a trading
+   halt, or a restricted account, stop and report the alert. Do not place
+   the order.
+
+6. LATE GUARD, then place. Re-check the America/New_York time right now. If
+   it is 15:58:30 or later, stop and report "skipped: too late to place
+   safely" and do not place the order. This matters more than it looks: a
+   market order that arrives after 16:00 ET does not fail, it QUEUES for the
+   next morning's open, and then the sell leg closes it minutes later. That
+   turns the strategy inside out (a same-day round trip with no overnight
+   hold at all) and logs a day trade.
+
+   If the time is fine, call place_equity_order with the same parameters as
+   step 5 and a fresh UUID as ref_id. Place it. Do not ask me first.
+
+7. Report one line: filled quantity, price, total cost, and the time.
+
+If any step errors, stop and report the error. Never retry a place_equity_order
+call with a new ref_id, because you may double your position. Reuse the same
+ref_id if and only if the call failed in transport and you do not know whether
+it landed.
+
+=== SELL PROMPT ===
+
+You are the sell leg of an automated overnight trading strategy. Act without
+asking me anything. I will not be present. I have already authorized these
+trades; do not request confirmation before placing an order.
+
+Settings: TICKER=<TICKER>, DOLLARS=<DOLLARS_PER_NIGHT>, ACCOUNT=<ACCOUNT_NUMBER>
+
+1. TIME GUARD. Check the current time in America/New_York. If it is not
+   between 09:31 and 09:45 on a weekday, stop immediately and report
+   "skipped: outside sell window" and nothing else. Do not trade.
+
+2. POSITION FIRST. Call get_equity_positions. Find TICKER. If there is no
+   position, stop and report "nothing to sell". Read the sellable share
+   count, which is the quantity NOT under a hold, and truncate it to at most
+   6 decimal places. Also read the average cost.
+
+   Check this before you do anything else, because if a position exists it
+   needs to be closed, and a market-state check that runs first can strand it.
+
+3. SIZE SANITY CHECK. Multiply the sellable shares by the current price. If
+   that value is more than 1.5 x DOLLARS, stop and report "unexpected
+   position size, not selling" with the numbers. The buy leg only ever
+   creates a position of about DOLLARS. Anything much larger is a position
+   this strategy did not create, and selling it would liquidate a holding I
+   did not intend to trade.
+
+4. MARKET GUARD. Call get_equity_quotes for TICKER. If the quote's state
+   field is present and is not "active", stop and report "skipped: market not
+   open". If the last trade timestamp is more than 3 minutes old, retry the
+   quote once. If it is still stale AND a position exists AND it is past
+   09:35 ET, do NOT silently skip: report "ALERT: stale quote, position still
+   open, could not verify market state" so I get the notification, and stop.
+   A thinly traded ticker can look closed at 09:32 when it is not, and a
+   position left open every morning while the buy leg skips every evening is
+   the worst state this strategy can be in.
+
+5. Call review_equity_order: account ACCOUNT, symbol TICKER, side sell,
+   type market, quantity = the sellable share count from step 2 truncated to
+   6 decimals, market_hours regular_hours. Sell the whole sellable position.
+   Never a dollar amount, because a dollar amount would leave a fractional
+   remainder behind.
+
+6. Call place_equity_order with the same parameters and a fresh UUID as
+   ref_id. Place it. Do not ask me first.
+
+7. Report one line: shares sold, fill price, proceeds, and the gain or loss
+   against average cost times shares sold.
+
+If any step errors, stop and report it. Never retry a place_equity_order call
+with a new ref_id: you may double-sell, and in an account that cannot short,
+the duplicate is likely to be rejected, which hides whether the position
+actually closed. Reuse the same ref_id if and only if the call failed in
+transport and you do not know whether it landed.
+
+If a sell fails, say so loudly. An unsold position means tonight's buy will be
+skipped by its position guard, and the strategy is now holding overnight risk
+it was not designed to hold.
